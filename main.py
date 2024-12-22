@@ -35,9 +35,16 @@ ALLOWED_EXTENSIONS = {'pdf', 'jpg', 'png'}
 
 # Allowed file extensions for attendance upload
 ATTENDANCE_ALLOWED_EXTENSIONS = {'xls', 'xlsx'}
+ALLOWED_EXTENSIONS = {'xlsx', 'xls'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def attendance_allowed_file(filename):
+    """Checks if the uploaded file has a valid Excel extension."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ATTENDANCE_ALLOWED_EXTENSIONS
+
+
 
 # Session timeout
 app.permanent_session_lifetime = timedelta(minutes=30)
@@ -70,7 +77,7 @@ fs = GridFS(mongo.db)
 @app.route('/')
 def index():
     return render_template('index.html')
-
+#routes for regster
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
@@ -102,7 +109,7 @@ def register():
         except Exception as e:
             flash(f"Error during registration: {e}", 'error')
     return render_template('register.html')
-
+#routes for login
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -134,13 +141,13 @@ def login():
             return redirect(url_for('login'))
 
     return render_template('login.html')
-
+#routes for logout
 @app.route('/logout')
 def logout():
     session.clear()
     flash('Logged out successfully', 'success')
     return redirect(url_for('login'))
-
+#routes for dashboard
 @app.route('/dashboard')
 def dashboard():
     if 'user_id' not in session:
@@ -158,26 +165,25 @@ def dashboard():
 
     flash("Invalid role. Please log in again.", "error")
     return redirect(url_for('login'))
-
 @app.route('/student_dashboard')
 def student_dashboard():
     if 'user_id' not in session or session.get('role') != 'Student':
         flash("Unauthorized access", "error")
         return redirect(url_for('login'))
-    
+
     student = mongo.db.students.find_one({'_id': ObjectId(session['user_id'])})
+    student_email = session.get('email')
+
     certificates = list(mongo.db.certificates.find({'student_id': session['user_id']}))
     meetings = list(mongo.db.meetings.find())
     notifications = list(mongo.db.notifications.find())
-    student_email = session.get('email')
+    
+    # Fetch marks
+    marks_records = list(mongo.db.mark.find({'email': student['email']}))
 
-    # Fetch attendance records for the student
+    # Attendance, volunteer, and additional details
     attendance_records = list(mongo.db.attendance.find({'Student Email': student['email']}))
-
-    # Fetch volunteer details for the student
     volunteer_details = list(mongo.db.volunteers.find({"student_email": student_email}))
-
-    # Fetch additional details
     mentor_name = student.get('mentor_name')
     anchor_name = student.get('anchor_name')
     father_name = student.get('father_name')
@@ -188,18 +194,13 @@ def student_dashboard():
     cgpa = student.get('cgpa')
     batch = student.get('batch')
 
-    # Convert MongoDB cursor to a list
-    for record in attendance_records:
-        record['_id'] = str(record['_id'])
-        record['Date'] = str(record['Date'])
-
-    #attendance_list = list(attendance_records)
     return render_template(
         'student_dashboard.html',
         student=student,
         certificates=certificates,
         meetings=meetings,
         notifications=notifications,
+        marks_records=marks_records,
         attendance_records=attendance_records,
         volunteer_details=volunteer_details,
         mentor_name=mentor_name,
@@ -212,7 +213,7 @@ def student_dashboard():
         cgpa=cgpa,
         batch=batch
     )
-
+#routes for admin dashboard
 @app.route('/admin_dashboard', methods=['GET', 'POST'])
 @role_required('Admin')
 def admin_dashboard():
@@ -264,7 +265,81 @@ def admin_dashboard():
         meetings=meetings,
         notifications=notifications
     )
+#rotes for upload marksheet page  
+@app.route('/upload_marksheet_page', methods=['GET', 'POST'])
+@role_required('Admin')
+def upload_marksheet_page():
+    success_message = None
+    error_message = None
+    
+    if request.method == 'POST':
+        # Get form data
+        test_name = request.form.get('test_name')
+        test_date = request.form.get('test_date')
+        mark_file = request.files.get('mark_file')
+        
+        # Validate the file format
+        if mark_file and allowed_file(mark_file.filename):
+            try:
+                temp_dir = os.path.join(app.root_path, 'temp')
+                if not os.path.exists(temp_dir):
+                    os.makedirs(temp_dir)
 
+                filename = secure_filename(mark_file.filename)
+                temp_path = os.path.join(temp_dir, filename)
+                mark_file.save(temp_path)
+
+                try:
+                    # Read the Excel file
+                    mark_df = pd.read_excel(temp_path)
+
+                    # Debug: Print the first few rows of the DataFrame to check the data
+                    print(mark_df.head())
+
+                except Exception as e:
+                    error_message = f"Error reading Excel file: {e}"
+                    os.remove(temp_path)
+                    return render_template('upload_marksheet_form.html', success_message=success_message, error_message=error_message)
+
+                # Check for required columns
+                required_columns = ['Email', 'Name', 'Marks']
+                missing_columns = [col for col in required_columns if col not in mark_df.columns]
+                if missing_columns:
+                    error_message = f"Missing required columns: {', '.join(missing_columns)}"
+                    os.remove(temp_path)
+                    return render_template('upload_marksheet_form.html', success_message=success_message, error_message=error_message)
+                
+                mark_records = []
+                # Iterate through the rows and store the data
+                for _, row in mark_df.iterrows():
+                    try:
+                        mark_record = {
+                            'email': row['Email'],
+                            'name': row['Name'],  # Ensure student name is updated
+                            'marks': float(row['Marks']),
+                            'test_name': test_name,  # Include the test name
+                            'test_date': test_date
+                        }
+                        mark_records.append(mark_record)
+                    except Exception as e:
+                        error_message = f"Invalid data in row: {row}. Error: {e}"
+                        os.remove(temp_path)
+                        return render_template('upload_marksheet_form.html', success_message=success_message, error_message=error_message)
+                
+                if mark_records:
+                    # Store the data in MongoDB
+                    mongo.db.mark.insert_many(mark_records)
+                    success_message = "Marks uploaded successfully."
+                os.remove(temp_path)
+            
+            except Exception as e:
+                error_message = f"Error uploading marks: {e}"
+
+        else:
+            error_message = 'Invalid file type. Please upload an Excel file.'
+
+    return render_template('upload_marksheet_form.html', success_message=success_message, error_message=error_message)
+#routes for create notificates
 @app.route('/create_notification', methods=['GET', 'POST'])
 @role_required('Admin')
 def create_notification():
@@ -285,7 +360,7 @@ def create_notification():
         return redirect(url_for('admin_dashboard'))  # Redirect back to the admin dashboard
 
     return render_template('create_notification.html')  # Render the notification creation form
-
+#routes for delete notification
 @app.route('/delete_notification/<string:notification_id>', methods=['POST'])
 @role_required('Admin')
 def delete_notification(notification_id):
@@ -297,7 +372,7 @@ def delete_notification(notification_id):
         flash(f"Error deleting notification: {e}", 'error')
 
     return redirect(url_for('admin_dashboard'))
-
+#routes for view student
 @app.route('/view_student/<student_id>', methods=['GET'])
 @role_required('Admin')  # Ensure only Admin can access this route
 def view_student(student_id):
@@ -312,11 +387,13 @@ def view_student(student_id):
     certificates = list(mongo.db.certificates.find({'student_id': student_id}))
     student_email = session.get('email')
     # Fetch volunteer work for the student volunteer_details = list(mongo.db.volunteers.find({"student_email": student_email}))
-    volunteer_details = list(mongo.db.volunteers.find({"student_email": student_email}))
+    volunteer_details = list(mongo.db.volunteers.find({"student_id": ObjectId(student_id)}))
         
     # Fetch attendance records for the student
-    attendance_records = list(mongo.db.attendance.find({'Student Email': student['email']}))
     # Fetch additional details
+    marks_records = list(mongo.db.mark.find({'email': student['email']}))
+    attendance_records = list(mongo.db.attendance.find({'Student Email': student['email']}))
+    
     mentor_name = student.get('mentor_name')
     anchor_name = student.get('anchor_name')
     father_name = student.get('father_name')
@@ -326,17 +403,14 @@ def view_student(student_id):
     college_name = student.get('college_name')
     cgpa = student.get('cgpa')
     batch = student.get('batch')
-    # Convert MongoDB cursor to a list
-    for record in attendance_records:
-        record['_id'] = str(record['_id'])
-        record['Date'] = str(record['Date'])
-
+    
     # Render the template
     return render_template(
         'view_student.html',
         student=student,
         certificates=certificates,
         attendance_records=attendance_records,
+        marks_records=marks_records,
         volunteer_details=volunteer_details,
         mentor_name=mentor_name,
         anchor_name=anchor_name,
@@ -348,8 +422,7 @@ def view_student(student_id):
         cgpa=cgpa,
         batch=batch
     )
-
-
+#routes for edit student
 @app.route('/edit_student/<string:student_id>', methods=['GET', 'POST'])
 def edit_student(student_id):
     if 'user_id' not in session:
@@ -399,8 +472,7 @@ def edit_student(student_id):
         return redirect(url_for('dashboard') if session.get('role') == 'Admin' else url_for('student_dashboard'))
 
     return render_template('edit_student.html', student=student)
-
-
+#routes for get student
 @app.route('/get_photo/<string:photo_id>')
 def get_photo(photo_id):
     try:
@@ -412,8 +484,7 @@ def get_photo(photo_id):
         }
     except Exception as e:
         return f"Error retrieving file: {e}", 404
-    
-    
+#routes for create meeting 
 @app.route('/create_meeting', methods=['GET', 'POST'])
 @role_required('Admin')
 def create_meeting():
@@ -453,7 +524,7 @@ def create_meeting():
         return redirect(url_for('admin_dashboard'))  # Redirect to admin dashboard
 
     return render_template('create_meeting.html')  # Render the form for creating a meeting
-
+#routes for upload certificate
 @app.route('/upload_certificate', methods=['GET', 'POST'])
 @role_required('Student')
 def upload_certificate():
@@ -501,8 +572,7 @@ def upload_certificate():
         volunteer_details=volunteer_details,
         attendance_records=attendance_records
     )
-    
-# Delete Meeting
+# routes for Delete Meeting
 @app.route('/delete_meeting/<string:meeting_id>', methods=['POST'])
 @role_required('Admin')
 def delete_meeting(meeting_id):
@@ -518,9 +588,7 @@ def delete_meeting(meeting_id):
         flash(f"Error deleting meeting: {e}", 'error')
 
     return redirect(url_for('admin_dashboard'))  # Redirect back to the admin dashboard
-
-
-# Delete Certificate
+#routes for Delete Certificate
 @app.route('/delete_certificate/<string:cert_id>', methods=['POST'])
 def delete_certificate(cert_id):
     certificate = mongo.db.certificates.find_one({'_id': ObjectId(cert_id)})
@@ -541,15 +609,13 @@ def delete_certificate(cert_id):
         flash('Unauthorized action', 'error')
     
     return redirect(url_for('student_dashboard'))
-
+#routes for certificates
 @app.route('/certificate/<file_id>')
 def get_certificate(file_id):
     # Fetch the certificate file from GridFS using the file_id
     file = fs.get(ObjectId(file_id))
     return send_file(file, mimetype=file.content_type)
-
-# everything is okay below here we are adding the upload attendance routres and also we are adding some codes in student dashboard and admindashboard for attendace 
-
+#routes for upload attendance
 @app.route('/upload_attendance', methods=['GET', 'POST'])
 @role_required('Admin')
 def upload_attendance():
@@ -613,18 +679,39 @@ def upload_attendance():
             error_message = 'Invalid file type. Please upload an Excel file.'
 
     return render_template('upload_attendance.html', success_message=success_message, error_message=error_message)
+#routes for upload volunteer
+@app.route('/update_volunteer/<volunteer_id>', methods=['GET', 'POST'])
+def update_volunteer(volunteer_id):
+    if 'user_id' not in session or session.get('role') != 'Student':
+        flash("Unauthorized access", "error")
+        return redirect(url_for('login'))
 
-@app.route('/view_attendance', methods=['GET'])
-@role_required('Student')
-def view_attendance():
-    user_email = session.get('email')  # Ensure email is stored in the session upon login
-    if not user_email:
-        return redirect(url_for('login'))  # Redirect if not logged in
+    volunteer = mongo.db.volunteers.find_one({'_id': ObjectId(volunteer_id)})
+    
+    if not volunteer:
+        flash("Volunteer details not found", "error")
+        return redirect(url_for('student_dashboard'))
 
-    attendance_records = list(mongo.db.attendance.find({"Student Email": user_email}))
-    return render_template('view_attendance.html', attendance=attendance_records)
+    if request.method == 'POST':
+        volunteer_name = request.form['volunteer_name']
+        description = request.form['description']
+        hours_worked = float(request.form['hours_worked'])
 
+        mongo.db.volunteers.update_one(
+            {'_id': ObjectId(volunteer_id)},
+            {'$set': {
+                'volunteer_name': volunteer_name,
+                'description': description,
+                'hours_worked': hours_worked,
+                'date_uploaded': datetime.datetime.now()
+            }}
+        )
+        
+        flash("Volunteer work updated successfully", "success")
+        return redirect(url_for('student_dashboard'))
 
+    return render_template('update_volunteer.html', volunteer=volunteer)
+#routes for add volunteer
 @app.route('/add_volunteer', methods=['GET', 'POST'])
 def add_volunteer():
     if 'user_id' not in session or session.get('role') != 'Student':
@@ -649,6 +736,6 @@ def add_volunteer():
         return redirect(url_for('student_dashboard'))
 
     return render_template('add_volunteer.html')
-
+#ending
 if __name__ == '__main__':
     app.run(debug=True)
